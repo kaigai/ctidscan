@@ -49,25 +49,22 @@
 #include "utils/spccache.h"
 
 /* missing declaration in pg_proc.h */
-#define TIDGreaterOperator		2800
-#define TIDLessEqualOperator	2801
-#define TIDGreaterEqualOperator	2802
+#ifndef TIDGreaterOperator
+#define TIDGreaterOperator			2800
+#endif
+#ifndef TIDLessEqualOperator
+#define TIDLessEqualOperator		2801
+#endif
+#ifndef TIDGreaterEqualOperator
+#define TIDGreaterEqualOperator		2802
+#endif
 
 PG_MODULE_MAGIC;
 
 typedef struct {
-	CustomPath		cpath;
-	List		   *ctid_quals;
-} CtidScanPath;
-
-typedef struct {
-	CustomScan		cscan;
-	List		   *ctid_quals;
-} CtidScanPlan;
-
-typedef struct {
-	CustomScanState	css;
+	TupleTableSlot *raw_slot;		/* raw scan slot */
 	List		   *ctid_quals;		/* list of ExprState for inequality ops */
+	List		   *pscan_tlist;	/* list of ExprState for pscan-tlist */
 } CtidScanState;
 
 /* function declarations */
@@ -81,18 +78,6 @@ static Plan *PlanCtidScanPath(PlannerInfo *root,
 							  CustomPath *best_path,
 							  List *tlist,
 							  List *clauses);
-static void TextOutCtidScanPath(StringInfo str, const CustomPath *cpath);
-
-static void SetCtidScanPlanRef(PlannerInfo *root,
-							   CustomScan *custom_plan,
-							   int rtoffset);
-static void FinalizeCtidScanPlan(PlannerInfo *root,
-								 CustomScan *custom_plan,
-								 bool (*finalize_primnode)(),
-								 void *finalize_context);
-static Node *CreateCtidScanState(CustomScan *custom_plan);
-static void TextOutCtidScanPlan(StringInfo str, const CustomScan *node);
-static CustomScan *CopyCtidScanPlan(const CustomScan *from);
 
 static void BeginCtidScan(CustomScanState *node, EState *estate, int eflags);
 static void ReScanCtidScan(CustomScanState *node);
@@ -106,19 +91,9 @@ static CustomPathMethods	ctidscan_path_methods = {
 	"ctidscan",				/* CustomName */
 	CreateCtidScanPath,		/* CreateCustomScanPath */
 	PlanCtidScanPath,		/* PlanCustomPath */
-	TextOutCtidScanPath,	/* TextOutCustomPath */
 };
 
-static CustomScanMethods	ctidscan_scan_methods = {
-	"ctidscan",				/* CustomName */
-	SetCtidScanPlanRef,		/* SetCustomScanRef */
-	FinalizeCtidScanPlan,	/* FinalizeCustomScan */
-	CreateCtidScanState,	/* CreateCustomScanState */
-	TextOutCtidScanPlan,	/* TextOutCustomScan */
-	CopyCtidScanPlan,		/* CopyCustomScan */
-};
-
-static CustomExecMethods	ctidscan_exec_methods = {
+static CustomScanMethods	ctidscan_exec_methods = {
 	"ctidscan",				/* CustomName */
 	BeginCtidScan,			/* BeginCustomScan */
 	ExecCtidScan,			/* ExecCustomScan */
@@ -127,7 +102,6 @@ static CustomExecMethods	ctidscan_exec_methods = {
 	NULL,					/* MarkPosCustomScan */
 	NULL,					/* RestrPosCustomScan */
 	ExplainCtidScan,		/* ExplainCustomScan */
-	NULL,					/* GetSpecialCustomVar */
 };
 
 #define IsCTIDVar(node,rtindex)											\
@@ -211,10 +185,10 @@ CTidQualFromExpr(Node *expr, int varno)
 static void
 CTidEstimateCosts(PlannerInfo *root,
 				  RelOptInfo *baserel,
-				  CtidScanPath *ctid_path)
+				  CustomPath *cpath)
 {
-	Path	   *path = &ctid_path->cpath.path;
-	List	   *ctid_quals = ctid_path->ctid_quals;
+	Path	   *path = &cpath->path;
+	List	   *ctid_quals = cpath->private;
 	ListCell   *lc;
 	double		ntuples;
 	ItemPointerData ip_min;
@@ -416,7 +390,7 @@ CreateCtidScanPath(PlannerInfo *root, RelOptInfo *baserel, RangeTblEntry *rte)
 	 */
 	if (ctid_quals != NIL)
 	{
-		CtidScanPath *ctid_path;
+		CustomPath *cpath;
 		Relids		required_outer;
 
 		/*
@@ -426,19 +400,19 @@ CreateCtidScanPath(PlannerInfo *root, RelOptInfo *baserel, RangeTblEntry *rte)
 		 */
 		required_outer = baserel->lateral_relids;
 
-		ctid_path = palloc0(sizeof(CtidScanPath));
-		ctid_path->cpath.path.type = T_CustomPath;
-		ctid_path->cpath.path.pathtype = T_CustomScan;
-		ctid_path->cpath.path.parent = baserel;
-		ctid_path->cpath.path.param_info
+		cpath = makeNode(CustomPath);
+		cpath->path.type = T_CustomPath;
+		cpath->path.pathtype = T_CustomScan;
+		cpath->path.parent = baserel;
+		cpath->path.param_info
 			= get_baserel_parampathinfo(root, baserel, required_outer);
-		ctid_path->cpath.flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN;
-		ctid_path->cpath.methods = &ctidscan_path_methods;
-		ctid_path->ctid_quals = ctid_quals;
+		cpath->flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN;
+		cpath->methods = &ctidscan_path_methods;
+		cpath->private = ctid_quals;
 
-		CTidEstimateCosts(root, baserel, ctid_path);
+		CTidEstimateCosts(root, baserel, cpath);
 
-		add_path(baserel, &ctid_path->cpath.path);
+		add_path(baserel, &cpath->path);
 	}
 }
 
@@ -454,142 +428,56 @@ PlanCtidScanPath(PlannerInfo *root,
 				 List *tlist,
 				 List *clauses)
 {
-	CtidScanPath   *ctid_path = (CtidScanPath *) best_path;
-	CtidScanPlan   *ctid_scan;
-	List		   *ctid_quals = ctid_path->ctid_quals;
+	CustomScan	   *cscan;
+	List		   *ctid_quals = best_path->private;
+	List		   *tlist_new = NIL;
+	List		   *tlist_org = NIL;
+	ListCell	   *cell;
 
-	ctid_scan = palloc0(sizeof(CtidScanPlan));
-	NodeSetTag(ctid_scan, T_CustomScan);
-	ctid_scan->cscan.flags = best_path->flags;
-	ctid_scan->cscan.methods = &ctidscan_scan_methods;
-
-	/* set scanrelid */
-	ctid_scan->cscan.scan.scanrelid = rel->relid;
-	/* set targetlist as is  */
-	ctid_scan->cscan.scan.plan.targetlist = tlist;
-	/* reduce RestrictInfo list to bare expressions */
-	ctid_scan->cscan.scan.plan.qual
-		= extract_actual_clauses(clauses, false);
-	/* set ctid related quals */
-	if (best_path->path.param_info)
-		ctid_quals = (List *)
-			replace_nestloop_params(root, (Node *)ctid_quals);
-	ctid_scan->ctid_quals = ctid_quals;
+	/* it should be a base rel... */
+	Assert(rel->relid > 0);
+	Assert(best_path->path.parent->rtekind == RTE_RELATION);
 
 	/*
-	 * If there are any pseudoconstant clauses attached to this node, insert a
-	 * gating Result node that evaluates the pseudoconstants as one-time
-	 * quals.
+	 * For example purpose, replace tlist by pseudo-scan tlist.
+	 * Usually, it intends to reference a value that was externally
+	 * computed instead of evaluation of complicated expression node.
 	 */
-	if (root->hasPseudoConstantQuals)
+	foreach (cell, tlist)
 	{
-		List   *pseudoconstants = extract_actual_clauses(clauses, true);
+		TargetEntry *tle = lfirst(cell);
+		Var		   *varnode;
 
-		if (pseudoconstants != NIL)
-			return (Plan *) make_result(root,
-										tlist,
-										(Node *) pseudoconstants,
-										(Plan *) ctid_scan);
+		Assert(tle->resno == list_length(tlist_org) + 1);
+
+		tlist_org = lappend(tlist_org, copyObject(tle));
+
+		varnode = makeVar(INDEX_VAR,
+						  tle->resno,
+						  exprType((Node *) tle->expr),
+						  exprTypmod((Node *) tle->expr),
+						  exprCollation((Node *) tle->expr),
+						  0);
+		tle = makeTargetEntry((Expr *) varnode,
+							  tle->resno,
+							  tle->resname ? pstrdup(tle->resname) : NULL,
+							  tle->resjunk);
+		tlist_new = lappend(tlist_new, tle);
 	}
-	return (Plan *) ctid_scan;
-}
 
-/*
- * TextOutCtidScanPath - A method of CustomPath; that shows a text
- * representation of the supplied CustomPath object.
- */
-static void
-TextOutCtidScanPath(StringInfo str, const CustomPath *cpath)
-{
-	CtidScanPath   *ctid_path = (CtidScanPath *)cpath;
+	/*
+	 * OK, make a custom-scan node
+	 */
+	cscan = makeNode(CustomScan);
+	cscan->scan.scanrelid = rel->relid;
+	cscan->scan.plan.targetlist = tlist_new;
+	cscan->scan.plan.qual = extract_actual_clauses(clauses, false);
+	cscan->flags = best_path->flags;
+	cscan->custom_exprs = ctid_quals;
+	cscan->pscan_tlist = tlist_org;
+	cscan->methods = &ctidscan_exec_methods;
 
-	appendStringInfo(str, " :ctid_quals %s",
-					 nodeToString(ctid_path->ctid_quals));
-}
-
-/*
- * SetCtidScanPlanRef - A method of CustomScan; that fixes up rtindex
- * of Var nodes
- */
-#define fix_scan_list(root, lst, rtoffset)	\
-	((List *) fix_scan_expr(root, (Node *) (lst), rtoffset))
-
-static void
-SetCtidScanPlanRef(PlannerInfo *root,
-				   CustomScan *custom_plan,
-				   int rtoffset)
-{
-	CtidScanPlan   *ctidscan = (CtidScanPlan *) custom_plan;
-	Scan		   *scan = &ctidscan->cscan.scan;
-
-	scan->scanrelid += rtoffset;
-	scan->plan.targetlist =
-		fix_scan_list(root, scan->plan.targetlist, rtoffset);
-	scan->plan.qual =
-		fix_scan_list(root, scan->plan.qual, rtoffset);
-	ctidscan->ctid_quals =
-		fix_scan_list(root, ctidscan->ctid_quals, rtoffset);
-}
-
-/*
- * FinalizeCtidScanPlan - A method of CustomScan; that handles callbacks
- * by finalize_plan().
- */
-static void
-FinalizeCtidScanPlan(PlannerInfo *root,
-					 CustomScan *custom_plan,
-					 bool (*finalize_primnode)(),
-					 void *finalize_context)
-{
-	CtidScanPlan   *ctid_plan = (CtidScanPlan *) custom_plan;
-
-	/* applies finalize_primnode() on ctid_quals also */
-	finalize_primnode((Node *)ctid_plan->ctid_quals, finalize_context);
-}
-
-/*
- * CreateCtidScanState - A method of CustomScan; that populate a custom
- * object being delivered from CustomScanState type, according to the
- * supplied CustomPath object.
- */
-static Node *
-CreateCtidScanState(CustomScan *custom_plan)
-{
-	CtidScanState  *ctss = palloc0(sizeof(CtidScanState));
-
-	NodeSetTag(ctss, T_CustomScanState);
-	ctss->css.flags = custom_plan->flags;
-	ctss->css.methods = &ctidscan_exec_methods;
-
-	return (Node *)&ctss->css;
-}
-
-/*
- * TextOutCtidScanPlan - A method of CustomScan; that generates text
- * representation of the given object.
- */
-static void
-TextOutCtidScanPlan(StringInfo str, const CustomScan *node)
-{
-	CtidScanPlan   *ctid_plan = (CtidScanPlan *) node;
-
-	appendStringInfo(str, " :ctid_quals %s",
-					 nodeToString(ctid_plan->ctid_quals));
-}
-
-/*
- * CopyCtidScanPlan - A method of CustomScan; that create a copied object.
- */
-static CustomScan *
-CopyCtidScanPlan(const CustomScan *from)
-{
-	CtidScanPlan   *oldnode = (CtidScanPlan *) from;
-	CtidScanPlan   *newnode = palloc0(sizeof(CtidScanPlan));
-
-	NodeSetTag(newnode, T_CustomScan);
-	newnode->ctid_quals = copyObject(oldnode->ctid_quals);
-
-	return &newnode->cscan;
+	return (Plan *)cscan;
 }
 
 /*
@@ -599,25 +487,22 @@ CopyCtidScanPlan(const CustomScan *from)
 static void
 BeginCtidScan(CustomScanState *node, EState *estate, int eflags)
 {
-	CtidScanState  *ctss = (CtidScanState *) node;
-	CtidScanPlan   *ctid_plan = (CtidScanPlan *) node->ss.ps.plan;
+	Relation		relation = node->ss.ss_currentRelation;
+	CustomScan	   *cscan = (CustomScan *) node->ss.ps.plan;
+	CtidScanState  *csstate = palloc0(sizeof(CtidScanState));
 
-	/*
-	 * In case of custom-plan provider that offers an alternative way
-	 * to scan a particular relation, most of the needed initialization,
-	 * like relation open or assignment of scan tuple-slot or projection
-	 * info, shall be done by the core implementation. So, all we need
-	 * to have is initialization of own local properties.
-	 */
-	ctss->ctid_quals = (List *)
-		ExecInitExpr((Expr *)ctid_plan->ctid_quals, &node->ss.ps);
+	/* Raw scan slot */
+	csstate->raw_slot = ExecAllocTableSlot(&estate->es_tupleTable);
+	ExecSetSlotDescriptor(csstate->raw_slot, RelationGetDescr(relation));
 
-	/* Do nothing anymore in EXPLAIN (no ANALYZE) case. */
-	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
-		return;
+	/* Init status of expression */
+	csstate->ctid_quals = (List *)
+		ExecInitExpr((Expr *) cscan->custom_exprs, &node->ss.ps);
+	csstate->pscan_tlist = (List *)
+		ExecInitExpr((Expr *) cscan->pscan_tlist, &node->ss.ps);
 
-	/* scandesc shall be set later */
-	ctss->css.ss.ss_currentScanDesc = NULL;
+	/* ScanDesc shall be set later */
+	node->ss.ss_currentScanDesc = NULL;
 }
 
 /*
@@ -627,12 +512,12 @@ BeginCtidScan(CustomScanState *node, EState *estate, int eflags)
 static void
 ReScanCtidScan(CustomScanState *node)
 {
-	CtidScanState  *ctss = (CtidScanState *)node;
-	HeapScanDesc	scan = ctss->css.ss.ss_currentScanDesc;
+	CtidScanState  *ctss = (CtidScanState *)node->state;
+	HeapScanDesc	scan = node->ss.ss_currentScanDesc;
 	EState		   *estate = node->ss.ps.state;
 	ScanDirection	direction = estate->es_direction;
-	Relation		relation = ctss->css.ss.ss_currentRelation;
-	ExprContext	   *econtext = ctss->css.ss.ps.ps_ExprContext;
+	Relation		relation = node->ss.ss_currentRelation;
+	ExprContext	   *econtext = node->ss.ps.ps_ExprContext;
 	ScanKeyData		keys[2];
 	bool			has_ubound = false;
 	bool			has_lbound = false;
@@ -644,7 +529,7 @@ ReScanCtidScan(CustomScanState *node)
 	if (scan)
 	{
 		heap_endscan(scan);
-		scan = ctss->css.ss.ss_currentScanDesc = NULL;
+		scan = node->ss.ss_currentScanDesc = NULL;
 	}
 
 	/* walks on the inequality operators */
@@ -660,7 +545,7 @@ ReScanCtidScan(CustomScanState *node)
 		ItemPointer		itemptr;
 		bool			isnull;
 
-		scanrelid = ((Scan *)ctss->css.ss.ps.plan)->scanrelid;
+		scanrelid = ((Scan *)node->ss.ps.plan)->scanrelid;
 		if (IsCTIDVar(arg1, scanrelid))
 		{
 			exstate = (ExprState *) lsecond(fexstate->args);
@@ -778,7 +663,7 @@ ReScanCtidScan(CustomScanState *node)
 								 scan->rs_nblocks - 1);
 		scan->rs_startblock = blknum;
 	}
-	ctss->css.ss.ss_currentScanDesc = scan;
+	node->ss.ss_currentScanDesc = scan;
 }
 
 /*
@@ -790,16 +675,19 @@ ReScanCtidScan(CustomScanState *node)
 static TupleTableSlot *
 CTidAccessCustomScan(CustomScanState *node)
 {
-	CtidScanState  *ctss = (CtidScanState *) node;
+	CtidScanState  *ctss = (CtidScanState *) node->state;
 	HeapScanDesc	scan;
 	TupleTableSlot *slot;
 	EState		   *estate = node->ss.ps.state;
+	ExprContext	   *econtext = node->ss.ps.ps_ExprContext;
 	ScanDirection	direction = estate->es_direction;
 	HeapTuple		tuple;
+	AttrNumber		anum = 0;
+	ListCell	   *lc;
 
-	if (!ctss->css.ss.ss_currentScanDesc)
+	if (!node->ss.ss_currentScanDesc)
 		ReScanCtidScan(node);
-	scan = ctss->css.ss.ss_currentScanDesc;
+	scan = node->ss.ss_currentScanDesc;
 	Assert(scan != NULL);
 
 	/*
@@ -808,9 +696,25 @@ CTidAccessCustomScan(CustomScanState *node)
 	tuple = heap_getnext(scan, direction);
 	if (!HeapTupleIsValid(tuple))
 		return NULL;
+	ExecStoreTuple(tuple, ctss->raw_slot, scan->rs_cbuf, false);
 
-	slot = ctss->css.ss.ss_ScanTupleSlot;
-	ExecStoreTuple(tuple, slot, scan->rs_cbuf, false);
+	/*
+	 * move to the pseudo scan slot
+	 */
+	econtext->ecxt_scantuple = ctss->raw_slot;
+	slot = node->ss.ss_ScanTupleSlot;
+	ExecStoreAllNullTuple(slot);
+	foreach (lc, ctss->pscan_tlist)
+	{
+		ExprState  *clause = lfirst(lc);
+		Datum		value;
+		bool		isnull;
+
+		value = ExecEvalExpr(clause, econtext, &isnull, NULL);
+		slot->tts_values[anum] = value;
+		slot->tts_isnull[anum] = isnull;
+		anum++;
+	}
 
 	return slot;
 }
@@ -840,10 +744,8 @@ ExecCtidScan(CustomScanState *node)
 static void
 EndCtidScan(CustomScanState *node)
 {
-	CtidScanState  *ctss = (CtidScanState *)node;
-
-	if (ctss->css.ss.ss_currentScanDesc)
-		heap_endscan(ctss->css.ss.ss_currentScanDesc);
+	if (node->ss.ss_currentScanDesc)
+		heap_endscan(node->ss.ss_currentScanDesc);
 }
 
 /*
@@ -853,19 +755,44 @@ EndCtidScan(CustomScanState *node)
 static void
 ExplainCtidScan(CustomScanState *node, List *ancestors, ExplainState *es)
 {
-	CtidScanState  *ctss = (CtidScanState *) node;
-	CtidScanPlan   *ctid_plan = (CtidScanPlan *) ctss->css.ss.ps.plan;
+	CustomScan	   *cscan = (CustomScan *) node->ss.ps.plan;
+	bool			use_prefix = es->verbose;
+	List		   *context;
+	ListCell	   *lc;
+	char		   *expr_str;
 
-	/* logic copied from show_qual and show_expression */
-	if (ctid_plan->ctid_quals)
+	/* set up a deparsing context */
+	context = deparse_context_for_planstate((Node *)&node->ss.ps,
+											ancestors,
+											es->rtable,
+											es->rtable_names);
+	/* pseudo relation */
+	if (cscan->pscan_tlist)
 	{
-		bool	useprefix = es->verbose;
-		Node   *qual;
-		List   *context;
-		char   *exprstr;
+		StringInfoData	buf;
 
-		/* Convert AND list to explicit AND */
-		qual = (Node *) make_ands_explicit(ctid_plan->ctid_quals);
+		initStringInfo(&buf);
+
+		foreach (lc, cscan->pscan_tlist)
+		{
+			TargetEntry	   *tle = lfirst(lc);
+
+			if (buf.len > 0)
+				appendStringInfo(&buf, ", ");
+			expr_str = deparse_expression((Node *)tle->expr,
+										  context,
+										  use_prefix,
+										  false);
+			appendStringInfo(&buf, "%s", expr_str);
+		}
+		/* And add to es->str */
+		ExplainPropertyText("pseudo scan", buf.data, es);
+	}
+
+	/* ctid scan logic */
+	if (cscan->private)
+	{
+		Node   *qual = (Node *) make_ands_explicit(cscan->private);
 
 		/* Set up deparsing context */
 		context = deparse_context_for_planstate((Node *)&node->ss.ps,
@@ -874,10 +801,10 @@ ExplainCtidScan(CustomScanState *node, List *ancestors, ExplainState *es)
 												es->rtable_names);
 
 		/* Deparse the expression */
-		exprstr = deparse_expression(qual, context, useprefix, false);
+		expr_str = deparse_expression(qual, context, use_prefix, false);
 
 		/* And add to es->str */
-		ExplainPropertyText("ctid quals", exprstr, es);
+		ExplainPropertyText("ctid quals", expr_str, es);
 	}
 }
 
