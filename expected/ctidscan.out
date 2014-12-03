@@ -316,6 +316,7 @@ EXPLAIN (costs off, format xml) EXECUTE p1('(0,0)'::tid, '(5,0)'::tid);
      <Plan>                                                                                               +
        <Node-Type>Custom Scan</Node-Type>                                                                 +
        <Custom-Plan-Provider>ctidscan</Custom-Plan-Provider>                                              +
+       <Relation-Name>t1</Relation-Name>                                                                  +
        <Alias>t1</Alias>                                                                                  +
        <Filter>((b ~~ '%abc%'::text) AND (ctid &gt;= '(0,0)'::tid) AND (ctid &lt;= '(5,0)'::tid))</Filter>+
        <ctid-quals>((ctid &gt;= '(0,0)'::tid) AND (ctid &lt;= '(5,0)'::tid))</ctid-quals>                 +
