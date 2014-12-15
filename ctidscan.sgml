@@ -1,0 +1,50 @@
+<sect1 id="ctidscan" xreflabel="ctidscan">
+ <title>ctidscan</title>
+
+ <indexterm zone="ctidscan">
+  <primary>ctidscan</primary>
+ </indexterm>
+
+ <para>
+  This module implements a custom-scan provider that utilizes inequality
+  operator that involves the <literal>ctid</literal> system column.
+ </para>
+
+ <para>
+  This module provides no SQL accessible interface. For installation,
+  all you need to do is just load the module to the server.
+
+  You can load it an individual session using:
+<programlisting>
+LOAD 'ctidscan';
+</programlisting>
+
+  or, you can also take more typical usage with extension preloading
+  using <xref linkend="guc-session-preload-libraries"> or
+  <xref linkend="guc-shared-preload-libraries"> in
+  <filename>postgresql.conf</>.
+
+  Then, planner may consider more cheap execution path if supplied query
+  involves above operators.
+ </para>
+ <variablelist>
+  <varlistentry>
+   <term>
+    <varname>enable_ctidscan</varname> (<type>bool</type>)
+    <indexterm>
+      <primary><varname>enable_ctidscan</> configuration parameter</primary>
+    </indexterm>
+   </term>
+   <listitem>
+    <para>
+     <varname>enable_ctidscan</varname> turns on/off functionality of
+     ctidscan custom-scan provider.
+     If turned off, it does not offer alternative scan path even if
+     supplied query is sufficient to run by ctidscan plan.
+     Its default is <literal>true</>.
+     Anybody can change using <command>SET</command> command.
+    </para>
+   </listitem>
+  </varlistentry>
+ </variablelist>
+</sect1>

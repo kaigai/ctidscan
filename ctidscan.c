@@ -1,7 +1,8 @@
 /*
  * ctidscan.c
  *
- * Definition of Custom TidScan implementation.
+ * A custom-scan provide that utilizes ctid system column within
+ * inequality-operators, to skip block reads never referenced.
  *
  * It is designed to demonstrate Custom Scan APIs; that allows to override
  * a part of executor node. This extension focus on a workload that tries
@@ -42,6 +43,7 @@
 #include "storage/itemptr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -49,21 +51,44 @@
 #include "utils/spccache.h"
 
 /* missing declaration in pg_proc.h */
+#ifndef TIDGreaterOperator
 #define TIDGreaterOperator		2800
+#endif
+#ifndef TIDLessEqualOperator
 #define TIDLessEqualOperator	2801
+#endif
+#ifndef TIDGreaterEqualOperator
 #define TIDGreaterEqualOperator	2802
+#endif
 
 PG_MODULE_MAGIC;
 
+/*
+ * NOTE: We don't use any special data type to save the private data.
+ * All we want to save in private fields is expression-list that shall
+ * be adjusted by setrefs.c/subselect.c, so we put it on the custom_exprs
+ * of CustomScan structure, not custom_private field.
+ * Due to the interface contract, only expression nodes are allowed to put
+ * on the custom_exprs, and we have to pay attention the core backend may
+ * adjust expression items.
+ */
+
+/*
+ * CtidScanState - state object of ctidscan on executor.
+ * It has few additional internal state. The 'ctid_quals' has list of
+ * ExprState for inequality operators that involve ctid system column.
+ */
 typedef struct {
 	CustomScanState	css;
 	List		   *ctid_quals;		/* list of ExprState for inequality ops */
 } CtidScanState;
 
+/* static variables */
+static bool		enable_ctidscan;
+static set_rel_pathlist_hook_type set_rel_pathlist_next = NULL;
+
 /* function declarations */
 void	_PG_init(void);
-
-static set_rel_pathlist_hook_type set_rel_pathlist_next = NULL;
 
 static void SetCtidScanPath(PlannerInfo *root,
 							RelOptInfo *rel,
@@ -146,7 +171,7 @@ CTidQualFromExpr(Node *expr, int varno)
 			return NULL;
 
 		if (list_length(op->args) != 2)
-			return false;
+			return false;	/* should not happen */
 
 		arg1 = linitial(op->args);
 		arg2 = lsecond(op->args);
@@ -158,7 +183,7 @@ CTidQualFromExpr(Node *expr, int varno)
 		else
 			return NULL;
 		if (exprType(other) != TIDOID)
-			return NULL;	/* probably can't happen */
+			return NULL;	/* should not happen */
 		/* The other argument must be a pseudoconstant */
 		if (!is_pseudo_constant_clause(other))
 			return NULL;
@@ -250,7 +275,8 @@ CTidEstimateCosts(PlannerInfo *root,
 
 			/*
 			 * Just an rough estimation, we don't distinct inequality and
-			 * inequality-or-equal operator.
+			 * inequality-or-equal operator from scan-size estimation
+			 * perspective.
 			 */
 			switch (opno)
 			{
@@ -379,6 +405,14 @@ SetCtidScanPath(PlannerInfo *root, RelOptInfo *baserel,
 		relkind != RELKIND_TOASTVALUE)
 		return;
 
+	/*
+	 * NOTE: Unlike built-in execution path, always we can have core path
+	 * even though ctid scan is not available. So, simply, we don't add
+	 * any paths, instead of adding disable_cost.
+	 */
+	if (!enable_ctidscan)
+		return;
+
 	/* walk on the restrict info */
 	foreach (lc, baserel->baserestrictinfo)
 	{
@@ -482,7 +516,7 @@ BeginCtidScan(CustomScanState *node, EState *estate, int eflags)
 	CustomScan	   *cscan = (CustomScan *) node->ss.ps.plan;
 
 	/*
-	 * In case of custom-plan provider that offers an alternative way
+	 * In case of custom-scan provider that offers an alternative way
 	 * to scan a particular relation, most of the needed initialization,
 	 * like relation open or assignment of scan tuple-slot or projection
 	 * info, shall be done by the core implementation. So, all we need
@@ -490,13 +524,6 @@ BeginCtidScan(CustomScanState *node, EState *estate, int eflags)
 	 */
 	ctss->ctid_quals = (List *)
 		ExecInitExpr((Expr *)cscan->custom_exprs, &node->ss.ps);
-
-	/* Do nothing anymore in EXPLAIN (no ANALYZE) case. */
-	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
-		return;
-
-	/* scandesc shall be set later */
-	ctss->css.ss.ss_currentScanDesc = NULL;
 }
 
 /*
@@ -766,6 +793,16 @@ ExplainCtidScan(CustomScanState *node, List *ancestors, ExplainState *es)
 void
 _PG_init(void)
 {
+	DefineCustomBoolVariable("enable_ctidscan",
+							 "Enables the planner's use of ctid-scan plans.",
+							 NULL,
+							 &enable_ctidscan,
+							 true,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
+
+	/* registration of the hook to add alternative path */
 	set_rel_pathlist_next = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = SetCtidScanPath;
 }
