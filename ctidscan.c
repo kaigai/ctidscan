@@ -99,7 +99,8 @@ static Plan *PlanCtidScanPath(PlannerInfo *root,
 							  RelOptInfo *rel,
 							  CustomPath *best_path,
 							  List *tlist,
-							  List *clauses);
+							  List *clauses,
+							  List *custom_plans);
 
 /* CustomScanMethods */
 static Node *CreateCtidScanState(CustomScan *custom_plan);
@@ -468,7 +469,8 @@ PlanCtidScanPath(PlannerInfo *root,
 				 RelOptInfo *rel,
 				 CustomPath *best_path,
 				 List *tlist,
-				 List *clauses)
+				 List *clauses,
+				 List *custom_plans)
 {
 	List		   *ctid_quals = best_path->custom_private;
 	CustomScan	   *cscan = makeNode(CustomScan);
@@ -774,10 +776,9 @@ ExplainCtidScan(CustomScanState *node, List *ancestors, ExplainState *es)
 		qual = (Node *) make_ands_explicit(cscan->custom_exprs);
 
 		/* Set up deparsing context */
-		context = deparse_context_for_planstate((Node *)&node->ss.ps,
-												ancestors,
-												es->rtable,
-												es->rtable_names);
+		context = set_deparse_context_planstate(es->deparse_cxt,
+												(Node *) &node->ss.ps,
+                                                ancestors);
 
 		/* Deparse the expression */
 		exprstr = deparse_expression(qual, context, useprefix, false);
