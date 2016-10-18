@@ -117,13 +117,17 @@ static void ExplainCtidScan(CustomScanState *node, List *ancestors,
 static CustomPathMethods	ctidscan_path_methods = {
 	"ctidscan",				/* CustomName */
 	PlanCtidScanPath,		/* PlanCustomPath */
+#if PG_VERSION_NUM < 90600
 	NULL,					/* TextOutCustomPath */
+#endif
 };
 
 static CustomScanMethods	ctidscan_scan_methods = {
 	"ctidscan",				/* CustomName */
 	CreateCtidScanState,	/* CreateCustomScanState */
+#if PG_VERSION_NUM < 90600
 	NULL,					/* TextOutCustomScan */
+#endif
 };
 
 static CustomExecMethods	ctidscan_exec_methods = {
@@ -134,6 +138,11 @@ static CustomExecMethods	ctidscan_exec_methods = {
 	ReScanCtidScan,			/* ReScanCustomScan */
 	NULL,					/* MarkPosCustomScan */
 	NULL,					/* RestrPosCustomScan */
+#if PG_VERSION_NUM >= 90600
+	NULL,					/* EstimateDSMCustomScan */
+	NULL,					/* InitializeDSMCustomScan */
+	NULL,					/* InitializeWorkerCustomScan */
+#endif
 	ExplainCtidScan,		/* ExplainCustomScan */
 };
 
@@ -447,6 +456,9 @@ SetCtidScanPath(PlannerInfo *root, RelOptInfo *baserel,
 		cpath->path.type = T_CustomPath;
 		cpath->path.pathtype = T_CustomScan;
 		cpath->path.parent = baserel;
+#if PG_VERSION_NUM >= 90600
+		cpath->path.pathtarget = baserel->reltarget;
+#endif
 		cpath->path.param_info
 			= get_baserel_parampathinfo(root, baserel, required_outer);
 		cpath->flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN;
