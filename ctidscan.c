@@ -81,6 +81,8 @@ PG_MODULE_MAGIC;
 typedef struct {
 	CustomScanState	css;
 	List		   *ctid_quals;		/* list of ExprState for inequality ops */
+	BlockNumber		lower_block;
+	BlockNumber		upper_block;
 } CtidScanState;
 
 /* static variables */
@@ -553,7 +555,6 @@ ReScanCtidScan(CustomScanState *node)
 	ScanDirection	direction = estate->es_direction;
 	Relation		relation = ctss->css.ss.ss_currentRelation;
 	ExprContext	   *econtext = ctss->css.ss.ps.ps_ExprContext;
-	ScanKeyData		keys[2];
 	bool			has_ubound = false;
 	bool			has_lbound = false;
 	ItemPointerData	ip_max;
@@ -617,11 +618,6 @@ ReScanCtidScan(CustomScanState *node)
 				if (!has_ubound ||
 					ItemPointerCompare(itemptr, &ip_max) <= 0)
 				{
-					ScanKeyInit(&keys[0],
-								SelfItemPointerAttributeNumber,
-								BTLessStrategyNumber,
-								F_TIDLT,
-								PointerGetDatum(itemptr));
 					ItemPointerCopy(itemptr, &ip_max);
 					has_ubound = true;
 				}
@@ -631,11 +627,6 @@ ReScanCtidScan(CustomScanState *node)
 				if (!has_ubound ||
 					ItemPointerCompare(itemptr, &ip_max) < 0)
 				{
-					ScanKeyInit(&keys[0],
-								SelfItemPointerAttributeNumber,
-								BTLessEqualStrategyNumber,
-								F_TIDLE,
-								PointerGetDatum(itemptr));
 					ItemPointerCopy(itemptr, &ip_max);
 					has_ubound = true;
 				}
@@ -645,11 +636,6 @@ ReScanCtidScan(CustomScanState *node)
 				if (!has_lbound ||
 					ItemPointerCompare(itemptr, &ip_min) >= 0)
 				{
-					ScanKeyInit(&keys[1],
-								SelfItemPointerAttributeNumber,
-								BTGreaterStrategyNumber,
-								F_TIDGT,
-								PointerGetDatum(itemptr));
 					ItemPointerCopy(itemptr, &ip_min);
 					has_lbound = true;
 				}
@@ -659,11 +645,6 @@ ReScanCtidScan(CustomScanState *node)
 				if (!has_lbound ||
 					ItemPointerCompare(itemptr, &ip_min) > 0)
 				{
-					ScanKeyInit(&keys[1],
-								SelfItemPointerAttributeNumber,
-								BTGreaterEqualStrategyNumber,
-								F_TIDGE,
-								PointerGetDatum(itemptr));
 					ItemPointerCopy(itemptr, &ip_min);
 					has_lbound = true;
 				}
@@ -676,14 +657,7 @@ ReScanCtidScan(CustomScanState *node)
 	}
 
 	/* begin heapscan with the key above */
-	if (has_ubound && has_lbound)
-		scan = heap_beginscan(relation, estate->es_snapshot, 2, &keys[0]);
-	else if (has_ubound)
-		scan = heap_beginscan(relation, estate->es_snapshot, 1, &keys[0]);
-	else if (has_lbound)
-		scan = heap_beginscan(relation, estate->es_snapshot, 1, &keys[1]);
-	else
-		scan = heap_beginscan(relation, estate->es_snapshot, 0, NULL);
+	scan = heap_beginscan(relation, estate->es_snapshot, 0, NULL);
 
 	/* Seek the starting position, if possible */
 	if (direction == ForwardScanDirection && has_lbound)
@@ -698,6 +672,10 @@ ReScanCtidScan(CustomScanState *node)
 								 scan->rs_nblocks - 1);
 		scan->rs_startblock = blknum;
 	}
+
+	ctss->lower_block = has_lbound ? BlockIdGetBlockNumber(&ip_min.ip_blkid) : (BlockNumber) 0;
+	ctss->upper_block = has_ubound ? BlockIdGetBlockNumber(&ip_max.ip_blkid) : MaxBlockNumber;
+
 	ctss->css.ss.ss_currentScanDesc = scan;
 }
 
@@ -727,6 +705,9 @@ CTidAccessCustomScan(CustomScanState *node)
 	 */
 	tuple = heap_getnext(scan, direction);
 	if (!HeapTupleIsValid(tuple))
+		return NULL;
+
+	if ((scan->rs_cblock < ctss->lower_block) || (ctss->upper_block < scan->rs_cblock))
 		return NULL;
 
 	slot = ctss->css.ss.ss_ScanTupleSlot;
